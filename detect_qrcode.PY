@@ -1,6 +1,6 @@
 import os
 import base64
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from PIL import Image
 from pyzbar.pyzbar import decode
 import fitz  # PyMuPDF
@@ -8,12 +8,172 @@ import qrcode
 from io import BytesIO
 from typing import List
 from uuid import uuid4
+import httpx
 
 app = FastAPI()
 
 # Cria o diretório "upload" se não existir
 UPLOAD_DIR = "upload"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/serpro-cnh-qr/")
+async def serpro_cnh_qr(file: UploadFile = File(...), cpf: str = Form(...)):
+    try:
+        # Verifica se o arquivo é uma imagem ou PDF
+        if file.content_type not in ["image/png", "image/jpeg", "application/pdf"]:
+            raise HTTPException(status_code=400, detail="Formato de arquivo não suportado. Use PNG, JPEG ou PDF.")
+
+        # Lê o arquivo enviado
+        contents = await file.read()
+
+        # Gera um identificador único para o arquivo
+        unique_id = str(uuid4())
+        file_extension = file.filename.split(".")[-1].upper()
+        file_name = f"cnh_{unique_id}.{file_extension.lower()}"
+        file_path = os.path.join(UPLOAD_DIR, file_name)
+
+        # Salva o arquivo na pasta 'upload'
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        # Converte o arquivo salvo em base64
+        file_base64 = convert_file_to_base64(file_path)
+
+        # Define o formato do QR Code baseado na extensão do arquivo
+        qrcode_format = "PNG" if file_extension in ["PNG", "JPG", "JPEG"] else "JPEG"
+
+        # Processa o arquivo para detectar QR Codes
+        if file.content_type in ["image/png", "image/jpeg"]:
+            # Para imagens, abrir com PIL e tentar decodificar o QR Code
+            image = Image.open(file_path)
+            qrcode_data, qrcode_images_base64 = decode_qrcode_from_image(image)
+
+        elif file.content_type == "application/pdf":
+            # Para PDF, extrair imagens das páginas e tentar decodificar QR Code
+            qrcode_data, qrcode_images_base64 = decode_qrcode_from_pdf(contents)
+
+        # Verifica se encontrou algum QR Code
+        if not qrcode_data:
+            raise HTTPException(status_code=400, detail="Nenhum QR Code encontrado no arquivo.")
+
+        # Utiliza o primeiro QR Code encontrado para a validação
+        qrcode_base64 = qrcode_images_base64[0]
+
+        # Faz a requisição para a API do Serpro
+        url = "https://gateway.apiserpro.serpro.gov.br/datavalid-demonstracao/v4/pf-facial-qrcode"
+        headers = {
+            "accept": "application/json",
+            "Authorization": "Bearer 06aef429-a981-3ec5-a1f8-71d38d86481e",  # Token exemplo, troque pelo seu válido
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "cpf": cpf,
+            "validacao": {
+                "qrcode": {
+                    "formato": qrcode_format,
+                    "base64": qrcode_base64
+                }
+            }
+        }
+
+        try:
+            # Faz a requisição para a API do Serpro
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, headers=headers, json=payload)
+            
+            # Verifica se a resposta foi bem-sucedida
+            if response.status_code == 200:
+                return response.json()
+            else:
+                try:
+                    # Tenta decodificar a mensagem de erro em JSON
+                    error_message = response.json()
+                except ValueError:
+                    # Se falhar, retorna o texto bruto
+                    error_message = response.text
+
+                raise HTTPException(status_code=response.status_code, detail=error_message)
+
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=500, detail=f"Erro na requisição à API Serpro: {str(e)}")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+
+
+def decode_qrcode_from_image(image: Image.Image) -> (List[str], List[str]):
+    """Decodifica QR Code de uma imagem e retorna os dados e as imagens em base64."""
+    qrcodes = decode(image)
+    qrcode_data = []
+    qrcode_images_base64 = []
+
+    for qrcode in qrcodes:
+        # Decodifica o texto do QR Code
+        data = qrcode.data.decode("utf-8")
+        qrcode_data.append(data)
+
+        # Extrai a área do QR Code e converte para base64
+        rect = qrcode.rect
+        qrcode_image = image.crop((rect.left, rect.top, rect.left + rect.width, rect.top + rect.height))
+        qrcode_images_base64.append(convert_image_to_base64(qrcode_image))
+
+    return qrcode_data, qrcode_images_base64
+
+
+def decode_qrcode_from_pdf(pdf_data: bytes) -> (List[str], List[str]):
+    """Extrai e decodifica QR Codes de um PDF, retorna os dados e as imagens em base64."""
+    qrcode_data = []
+    qrcode_images_base64 = []
+
+    # Abre o PDF com PyMuPDF
+    pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
+    
+    # Itera por cada página do PDF
+    for page_num in range(pdf_document.page_count):
+        page = pdf_document[page_num]
+        
+        # Converte a página para imagem (matriz de pixels)
+        pix = page.get_pixmap()
+        
+        # Cria uma imagem PIL a partir da matriz de pixels
+        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        # Decodifica QR Codes da imagem
+        data, images_base64 = decode_qrcode_from_image(image)
+        qrcode_data.extend(data)
+        qrcode_images_base64.extend(images_base64)
+    
+    pdf_document.close()
+    return qrcode_data, qrcode_images_base64
+
+
+def generate_qrcode_base64(data: str) -> str:
+    """Gera um QR Code a partir de uma string e retorna em formato base64."""
+    # Cria um objeto de QR Code
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=10, border=4)
+    qr.add_data(data)
+    qr.make(fit=True)
+    
+    # Gera a imagem do QR Code
+    img = qr.make_image(fill='black', back_color='white')
+    
+    # Converte a imagem para base64
+    return convert_image_to_base64(img)
+
+
+def convert_image_to_base64(image: Image.Image) -> str:
+    """Converte uma imagem PIL para uma string base64."""
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+
+def convert_file_to_base64(file_path: str) -> str:
+    """Converte um arquivo para base64."""
+    with open(file_path, "rb") as file:
+        file_base64 = base64.b64encode(file.read()).decode("utf-8")
+    return file_base64
+
 
 @app.post("/detect-qrcode/")
 async def detect_qrcode(file: UploadFile = File(...)):
@@ -35,82 +195,41 @@ async def detect_qrcode(file: UploadFile = File(...)):
         with open(file_path, "wb") as f:
             f.write(contents)
         
+        # Converte o arquivo salvo em base64
+        file_base64 = convert_file_to_base64(file_path)
+
         # Processa o arquivo para detectar QR Codes
         if file.content_type in ["image/png", "image/jpeg"]:
             # Para imagens, abrir com PIL e tentar decodificar o QR Code
             image = Image.open(file_path)
-            qrcode_data = decode_qrcode_from_image(image)
+            qrcode_data, qrcode_images_base64 = decode_qrcode_from_image(image)
 
         elif file.content_type == "application/pdf":
             # Para PDF, extrair imagens das páginas e tentar decodificar QR Code
-            qrcode_data = decode_qrcode_from_pdf(contents)
+            qrcode_data, qrcode_images_base64 = decode_qrcode_from_pdf(contents)
 
         # Verifica se encontrou algum QR Code
         if not qrcode_data:
             return {
                 "message": "Nenhum QR Code encontrado no arquivo.",
-                "file_path": file_path
+                "file_path": file_path,
+                "file_base64": file_base64
             }
 
         # Gera um novo QR Code em base64 para cada QR Code detectado
         qrcode_base64_list = [generate_qrcode_base64(data) for data in qrcode_data]
 
-        # Retorna o texto decodificado do QR Code, o QR Code gerado em base64 e a localização do arquivo
+        # Retorna o texto decodificado do QR Code, a localização do arquivo e as imagens extraídas
         return {
             "qrcode_data": qrcode_data,
-            "file_path": file_name,
-            "qrcode_base64": qrcode_base64_list
+            "qrcode_base64": qrcode_base64_list,
+            "qrcode_images_base64": qrcode_images_base64,
+            "file_path": file_path,
+            "file_base64": file_base64
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
-
-
-def decode_qrcode_from_image(image: Image.Image) -> List[str]:
-    """Decodifica QR Code de uma imagem."""
-    qrcodes = decode(image)
-    return [qrcode.data.decode("utf-8") for qrcode in qrcodes]
-
-
-def decode_qrcode_from_pdf(pdf_data: bytes) -> List[str]:
-    """Extrai e decodifica QR Codes de um PDF."""
-    qrcode_data = []
-    # Abre o PDF com PyMuPDF
-    pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
-    
-    # Itera por cada página do PDF
-    for page_num in range(pdf_document.page_count):
-        page = pdf_document[page_num]
-        
-        # Converte a página para imagem (matriz de pixels)
-        pix = page.get_pixmap()
-        
-        # Cria uma imagem PIL a partir da matriz de pixels
-        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
-        # Decodifica QR Codes da imagem
-        qrcode_data.extend(decode_qrcode_from_image(image))
-    
-    pdf_document.close()
-    return qrcode_data
-
-
-def generate_qrcode_base64(data: str) -> str:
-    """Gera um QR Code a partir de uma string e retorna em formato base64."""
-    # Cria um objeto de QR Code
-    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=10, border=4)
-    qr.add_data(data)
-    qr.make(fit=True)
-    
-    # Gera a imagem do QR Code
-    img = qr.make_image(fill='black', back_color='white')
-    
-    # Converte a imagem para base64
-    buffered = BytesIO()
-    img.save(buffered, format="PNG")
-    img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    
-    return img_base64
 
 if __name__ == "__main__":
     import uvicorn

@@ -17,32 +17,52 @@ UPLOAD_DIR = "upload"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.post("/serpro-cnh-qr/")
-async def serpro_cnh_qr(file: UploadFile = File(...), cpf: str = Form(...)):
+async def serpro_cnh_qr(file: UploadFile = File(...), foto_pessoal: UploadFile = File(...), cpf: str = Form(...)):
     try:
         # Verifica se o arquivo é uma imagem ou PDF
         if file.content_type not in ["image/png", "image/jpeg", "application/pdf"]:
             raise HTTPException(status_code=400, detail="Formato de arquivo não suportado. Use PNG, JPEG ou PDF.")
 
-        # Lê o arquivo enviado
+        # Lê o arquivo do QR Code enviado
         contents = await file.read()
 
-        # Gera um identificador único para o arquivo
+        # Gera um identificador único para o arquivo do QR Code
         unique_id = str(uuid4())
         file_extension = file.filename.split(".")[-1].upper()
         file_name = f"cnh_{unique_id}.{file_extension.lower()}"
         file_path = os.path.join(UPLOAD_DIR, file_name)
 
-        # Salva o arquivo na pasta 'upload'
+        # Salva o arquivo do QR Code na pasta 'upload'
         with open(file_path, "wb") as f:
             f.write(contents)
 
         # Converte o arquivo salvo em base64
         file_base64 = convert_file_to_base64(file_path)
 
-        # Define o formato do QR Code baseado na extensão do arquivo
+        # Forçar o formato do QR Code para "PNG" ou "JPEG"
         qrcode_format = "PNG" if file_extension in ["PNG", "JPG", "JPEG"] else "JPEG"
 
-        # Processa o arquivo para detectar QR Codes
+        # Lê e salva a foto pessoal do usuário
+        foto_extension = foto_pessoal.filename.split(".")[-1].lower()
+        foto_file_name = f"foto_{cpf}{unique_id}.{foto_extension}"
+        foto_file_path = os.path.join(UPLOAD_DIR, foto_file_name)
+
+        # Salva a foto pessoal enviada diretamente
+        with open(foto_file_path, "wb") as f:
+            f.write(await foto_pessoal.read())
+
+        # Converte a foto pessoal para base64 sem decodificação incorreta
+        foto_pessoal_base64 = convert_file_to_base64(foto_file_path)
+
+        # Força o formato como "JPG", "PNG" ou "PDF" dependendo da extensão da foto pessoal
+        if foto_extension in ["jpg", "jpeg"]:
+            biometria_format = "JPG"
+        elif foto_extension == "png":
+            biometria_format = "PNG"
+        else:
+            raise HTTPException(status_code=400, detail="Formato de foto pessoal não suportado. Use JPG ou PNG.")
+
+        # Processa o arquivo do QR Code para detectar QR Codes
         if file.content_type in ["image/png", "image/jpeg"]:
             # Para imagens, abrir com PIL e tentar decodificar o QR Code
             image = Image.open(file_path)
@@ -72,6 +92,11 @@ async def serpro_cnh_qr(file: UploadFile = File(...), cpf: str = Form(...)):
                 "qrcode": {
                     "formato": qrcode_format,
                     "base64": qrcode_base64
+                },
+                "biometria_facial": {
+                    "vivacidade": True,
+                    "formato": biometria_format,
+                    "base64": foto_pessoal_base64
                 }
             }
         }
@@ -171,7 +196,7 @@ def convert_image_to_base64(image: Image.Image) -> str:
 def convert_file_to_base64(file_path: str) -> str:
     """Converte um arquivo para base64."""
     with open(file_path, "rb") as file:
-        file_base64 = base64.b64encode(file.read()).decode("utf-8")
+        file_base64 = base64.b64encode(file.read()).decode()  # Corrigido para não usar .decode('utf-8')
     return file_base64
 
 
@@ -230,6 +255,7 @@ async def detect_qrcode(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
